@@ -48,18 +48,16 @@
             {
                 EndpointSetup<DefaultServer>(config =>
                 {
-                    config.ConfigureTransport().Routing().RouteToEndpoint(typeof(Request), typeof(ReceivingEndpoint));
+                    config.ConfigureRouting().RouteToEndpoint(typeof(Request), typeof(ReceivingEndpoint));
                     config.AuditProcessedMessagesTo<AuditSpyEndpoint>();
                 });
             }
 
             class ReplyHandler : IHandleMessages<Reply>
             {
-                public MyContext Context { get; set; }
-
                 public Task Handle(Reply message, IMessageHandlerContext context)
                 {
-                    return TaskEx.CompletedTask;
+                    return Task.CompletedTask;
                 }
             }
         }
@@ -84,13 +82,18 @@
 
             class ReplyHandler : IHandleMessages<Reply>
             {
-                public MyContext Context { get; set; }
+                MyContext testContext;
+
+                public ReplyHandler(MyContext testContext)
+                {
+                    this.testContext = testContext;
+                }
 
                 public Task Handle(Reply message, IMessageHandlerContext context)
                 {
-                    Context.IncorrectHandlerInvoked = true;
+                    testContext.IncorrectHandlerInvoked = true;
 
-                    return TaskEx.CompletedTask;
+                    return Task.CompletedTask;
                 }
             }
         }
@@ -104,13 +107,18 @@
 
             class ReplyHandler : IHandleMessages<Reply>
             {
-                public MyContext Context { get; set; }
+                MyContext testContext;
+
+                public ReplyHandler(MyContext testContext)
+                {
+                    this.testContext = testContext;
+                }
 
                 public Task Handle(Reply message, IMessageHandlerContext context)
                 {
-                    Context.AuditMessageReceived = true;
+                    testContext.AuditMessageReceived = true;
 
-                    return TaskEx.CompletedTask;
+                    return Task.CompletedTask;
                 }
             }
         }

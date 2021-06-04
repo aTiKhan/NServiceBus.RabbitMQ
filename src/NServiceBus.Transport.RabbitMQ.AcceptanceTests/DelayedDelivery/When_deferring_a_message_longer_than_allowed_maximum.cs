@@ -3,7 +3,6 @@
     using System;
     using System.Threading.Tasks;
     using AcceptanceTesting;
-    using Features;
     using NServiceBus.AcceptanceTests;
     using NServiceBus.AcceptanceTests.EndpointTemplates;
     using NUnit.Framework;
@@ -29,19 +28,19 @@
                 .Run());
 
             Assert.That(exception, Is.Not.Null);
-            Assert.IsTrue(exception.Message.StartsWith("Message cannot be sent with"));
+            StringAssert.StartsWith("Message cannot be delayed by", exception.Message);
         }
 
         public class Endpoint : EndpointConfigurationBuilder
         {
             public Endpoint()
             {
-                EndpointSetup<DefaultServer>(config => config.EnableFeature<TimeoutManager>());
+                EndpointSetup<DefaultServer>();
             }
 
             public class MyMessageHandler : IHandleMessages<MyMessage>
             {
-                public Task Handle(MyMessage message, IMessageHandlerContext context) => TaskEx.CompletedTask;
+                public Task Handle(MyMessage message, IMessageHandlerContext context) => Task.CompletedTask;
             }
         }
 

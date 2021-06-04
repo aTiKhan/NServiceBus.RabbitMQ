@@ -71,23 +71,28 @@
             public ScaledOutClient()
             {
                 EndpointSetup<DefaultServer>(config =>
-                    config.ConfigureTransport().Routing().RouteToEndpoint(typeof(MyRequest), typeof(ServerThatRespondsToCallbacks)));
+                    config.ConfigureRouting().RouteToEndpoint(typeof(MyRequest), typeof(ServerThatRespondsToCallbacks)));
             }
 
             class MyResponseHandler : IHandleMessages<MyResponse>
             {
-                public ReadOnlySettings Settings { get; set; }
+                ReadOnlySettings settings;
+                Context testContext;
 
-                public Context Context { get; set; }
+                public MyResponseHandler(ReadOnlySettings settings, Context testContext)
+                {
+                    this.settings = settings;
+                    this.testContext = testContext;
+                }
 
                 public Task Handle(MyResponse message, IMessageHandlerContext context)
                 {
-                    if (Settings.Get<string>("Client") != message.Client)
+                    if (settings.Get<string>("Client") != message.Client)
                     {
                         throw new Exception("Wrong endpoint got the response.");
                     }
-                    Context.ReplyReceived();
-                    return TaskEx.CompletedTask;
+                    testContext.ReplyReceived();
+                    return Task.CompletedTask;
                 }
             }
         }

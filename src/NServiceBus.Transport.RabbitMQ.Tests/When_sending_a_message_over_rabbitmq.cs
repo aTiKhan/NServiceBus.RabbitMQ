@@ -4,15 +4,15 @@
     using System.Collections.Generic;
     using System.Linq;
     using System.Text;
+    using System.Threading;
     using System.Threading.Tasks;
-    using Extensibility;
     using global::RabbitMQ.Client.Events;
     using NUnit.Framework;
 
     [TestFixture]
     class When_sending_a_message_over_rabbitmq : RabbitMqContext
     {
-        const string queueToReceiveOn = "testEndPoint";
+        const string QueueToReceiveOn = "testEndPoint";
 
         [Test]
         public Task Should_populate_the_body()
@@ -72,15 +72,14 @@
         }
 
         [Test]
-        public Task Should_preserve_the_recoverable_setting_if_set_to_durable()
+        public Task Should_honor_the_non_persistent_flag()
         {
-            return Verify(new OutgoingMessageBuilder(), result => Assert.True(result.Headers[Headers.NonDurableMessage] == "False"));
-        }
-
-        [Test]
-        public Task Should_preserve_the_recoverable_setting_if_set_to_non_durable()
-        {
-            return Verify(new OutgoingMessageBuilder().NonDurable(), result => Assert.True(result.Headers[Headers.NonDurableMessage] == "True"));
+            return Verify(new OutgoingMessageBuilder().WithHeader(BasicPropertiesExtensions.UseNonPersistentDeliveryHeader, true.ToString()), (message, basicDeliverEventArgs) =>
+            {
+                Assert.False(basicDeliverEventArgs.BasicProperties.Persistent);
+                Assert.False(basicDeliverEventArgs.BasicProperties.Headers.ContainsKey(BasicPropertiesExtensions.UseNonPersistentDeliveryHeader), "Temp header should not be visible on the wire");
+                Assert.True(message.Headers.ContainsKey(BasicPropertiesExtensions.UseNonPersistentDeliveryHeader), "Temp header should not removed to make sure that retries keeps the setting");
+            });
         }
 
         [Test]
@@ -94,30 +93,30 @@
                 });
         }
 
-        protected override IEnumerable<string> AdditionalReceiverQueues => new[] { queueToReceiveOn };
+        protected override IEnumerable<string> AdditionalReceiverQueues => new[] { QueueToReceiveOn };
 
-        async Task Verify(OutgoingMessageBuilder builder, Action<IncomingMessage, BasicDeliverEventArgs> assertion)
+        async Task Verify(OutgoingMessageBuilder builder, Action<IncomingMessage, BasicDeliverEventArgs> assertion, CancellationToken cancellationToken = default)
         {
-            var operations = builder.SendTo(queueToReceiveOn).Build();
+            var operations = builder.SendTo(QueueToReceiveOn).Build();
 
-            await messageDispatcher.Dispatch(operations, new TransportTransaction(), new ContextBag());
+            await messageDispatcher.Dispatch(operations, new TransportTransaction(), cancellationToken);
 
             var messageId = operations.MulticastTransportOperations.FirstOrDefault()?.Message.MessageId ?? operations.UnicastTransportOperations.FirstOrDefault()?.Message.MessageId;
 
-            var result = Consume(messageId, queueToReceiveOn);
+            var result = Consume(messageId, QueueToReceiveOn);
 
-            var converter = new MessageConverter();
+            var converter = new MessageConverter(MessageConverter.DefaultMessageIdStrategy);
             var convertedHeaders = converter.RetrieveHeaders(result);
             var convertedMessageId = converter.RetrieveMessageId(result, convertedHeaders);
 
-            var incomingMessage = new IncomingMessage(convertedMessageId, convertedHeaders, result.Body);
+            var incomingMessage = new IncomingMessage(convertedMessageId, convertedHeaders, result.Body.ToArray());
 
             assertion(incomingMessage, result);
         }
 
-        Task Verify(OutgoingMessageBuilder builder, Action<IncomingMessage> assertion) => Verify(builder, (t, r) => assertion(t));
+        Task Verify(OutgoingMessageBuilder builder, Action<IncomingMessage> assertion, CancellationToken cancellationToken = default) => Verify(builder, (t, r) => assertion(t), cancellationToken);
 
-        Task Verify(OutgoingMessageBuilder builder, Action<BasicDeliverEventArgs> assertion) => Verify(builder, (t, r) => assertion(r));
+        Task Verify(OutgoingMessageBuilder builder, Action<BasicDeliverEventArgs> assertion, CancellationToken cancellationToken = default) => Verify(builder, (t, r) => assertion(r), cancellationToken);
 
         BasicDeliverEventArgs Consume(string id, string queueToReceiveOn)
         {

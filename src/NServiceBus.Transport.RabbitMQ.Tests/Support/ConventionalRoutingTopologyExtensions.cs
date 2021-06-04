@@ -1,15 +1,16 @@
-﻿using System.Collections.Generic;
-using System.Linq;
-
-namespace NServiceBus.Transport.RabbitMQ.Tests.Support
+﻿namespace NServiceBus.Transport.RabbitMQ.Tests.Support
 {
+    using System.Collections.Generic;
+    using System.Linq;
+
     static class ConventionalRoutingTopologyExtensions
     {
         public static void Reset(
             this ConventionalRoutingTopology routingTopology,
             ConnectionFactory connectionFactory,
             IEnumerable<string> receivingAddresses,
-            IEnumerable<string> sendingAddresses)
+            IEnumerable<string> sendingAddresses,
+            bool useQuorumQueues)
         {
             using (var connection = connectionFactory.CreateAdministrationConnection())
             using (var channel = connection.CreateModel())
@@ -23,7 +24,7 @@ namespace NServiceBus.Transport.RabbitMQ.Tests.Support
                 DelayInfrastructure.TearDown(channel);
                 DelayInfrastructure.Build(channel);
 
-                routingTopology.Initialize(channel, receivingAddresses, sendingAddresses);
+                routingTopology.Initialize(connection, receivingAddresses, sendingAddresses, useQuorumQueues, false);
             }
         }
     }

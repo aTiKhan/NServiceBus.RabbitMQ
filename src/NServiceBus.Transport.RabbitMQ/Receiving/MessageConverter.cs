@@ -4,15 +4,8 @@
     using System.Collections.Generic;
     using System.Text;
     using global::RabbitMQ.Client.Events;
-    using Logging;
-
     class MessageConverter
     {
-        public MessageConverter()
-        {
-            messageIdStrategy = DefaultMessageIdStrategy;
-        }
-
         public MessageConverter(Func<BasicDeliverEventArgs, string> messageIdStrategy)
         {
             this.messageIdStrategy = messageIdStrategy;
@@ -58,15 +51,15 @@
                 deserializedHeaders[Headers.CorrelationId] = properties.CorrelationId;
             }
 
+            if (properties.IsDeliveryModePresent() && properties.DeliveryMode == 1)
+            {
+                deserializedHeaders[BasicPropertiesExtensions.UseNonPersistentDeliveryHeader] = bool.TrueString;
+            }
+
             //When doing native interop we only require the type to be set the "fullName" of the message
             if (!deserializedHeaders.ContainsKey(Headers.EnclosedMessageTypes) && properties.IsTypePresent())
             {
                 deserializedHeaders[Headers.EnclosedMessageTypes] = properties.Type;
-            }
-
-            if (properties.IsDeliveryModePresent())
-            {
-                deserializedHeaders[Headers.NonDurableMessage] = (properties.DeliveryMode == 1).ToString();
             }
 
             if (deserializedHeaders.ContainsKey("NServiceBus.RabbitMQ.CallbackQueue"))
@@ -77,7 +70,7 @@
             return deserializedHeaders;
         }
 
-        string DefaultMessageIdStrategy(BasicDeliverEventArgs message)
+        public static string DefaultMessageIdStrategy(BasicDeliverEventArgs message)
         {
             var properties = message.BasicProperties;
 
@@ -151,7 +144,7 @@
 
             if (value is global::RabbitMQ.Client.AmqpTimestamp timestamp)
             {
-                return DateTimeExtensions.ToWireFormattedString(UnixEpoch.AddSeconds(timestamp.UnixTime));
+                return DateTimeOffsetHelper.ToWireFormattedString(UnixEpoch.AddSeconds(timestamp.UnixTime));
             }
 
             return value?.ToString();
@@ -159,8 +152,6 @@
 
         readonly Func<BasicDeliverEventArgs, string> messageIdStrategy;
 
-        static ILog Logger = LogManager.GetLogger(typeof(MessageConverter));
-
-        static readonly DateTime UnixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        static readonly DateTimeOffset UnixEpoch = new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
     }
 }

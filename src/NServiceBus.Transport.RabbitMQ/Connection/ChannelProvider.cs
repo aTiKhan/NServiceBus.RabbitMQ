@@ -2,19 +2,19 @@ namespace NServiceBus.Transport.RabbitMQ
 {
     using System;
     using System.Collections.Concurrent;
+    using System.Threading;
     using System.Threading.Tasks;
     using global::RabbitMQ.Client;
     using Logging;
 
     sealed class ChannelProvider : IDisposable
     {
-        public ChannelProvider(ConnectionFactory connectionFactory, TimeSpan retryDelay, IRoutingTopology routingTopology, bool usePublisherConfirms)
+        public ChannelProvider(ConnectionFactory connectionFactory, TimeSpan retryDelay, IRoutingTopology routingTopology)
         {
             this.connectionFactory = connectionFactory;
             this.retryDelay = retryDelay;
 
             this.routingTopology = routingTopology;
-            this.usePublisherConfirms = usePublisherConfirms;
 
             channels = new ConcurrentQueue<ConfirmsAwareChannel>();
         }
@@ -29,15 +29,16 @@ namespace NServiceBus.Transport.RabbitMQ
         {
             if (e.Initiator != ShutdownInitiator.Application)
             {
-                Task.Run(Reconnect).Ignore();
+                // Task.Run() so the call returns immediately instead of waiting for the first await or return down the call stack
+                _ = Task.Run(() => ReconnectSwallowingExceptions(), CancellationToken.None);
             }
         }
 
-        async Task Reconnect()
+#pragma warning disable PS0018 // A task-returning method should have a CancellationToken parameter unless it has a parameter implementing ICancellableContext
+        async Task ReconnectSwallowingExceptions()
+#pragma warning restore PS0018 // A task-returning method should have a CancellationToken parameter unless it has a parameter implementing ICancellableContext
         {
-            var reconnected = false;
-
-            while (!reconnected)
+            while (true)
             {
                 Logger.InfoFormat("Attempting to reconnect in {0} seconds.", retryDelay.TotalSeconds);
 
@@ -46,15 +47,15 @@ namespace NServiceBus.Transport.RabbitMQ
                 try
                 {
                     CreateConnection();
-                    reconnected = true;
-
-                    Logger.Info("Connection to the broker reestablished successfully.");
+                    break;
                 }
-                catch(Exception e)
+                catch (Exception ex)
                 {
-                    Logger.Info("Reconnecting to the broker failed.", e);
+                    Logger.Info("Reconnecting to the broker failed.", ex);
                 }
             }
+
+            Logger.Info("Connection to the broker reestablished successfully.");
         }
 
         public ConfirmsAwareChannel GetPublishChannel()
@@ -63,7 +64,7 @@ namespace NServiceBus.Transport.RabbitMQ
             {
                 channel?.Dispose();
 
-                channel = new ConfirmsAwareChannel(connection, routingTopology, usePublisherConfirms);
+                channel = new ConfirmsAwareChannel(connection, routingTopology);
             }
 
             return channel;
@@ -97,7 +98,6 @@ namespace NServiceBus.Transport.RabbitMQ
         readonly ConnectionFactory connectionFactory;
         readonly TimeSpan retryDelay;
         readonly IRoutingTopology routingTopology;
-        readonly bool usePublisherConfirms;
         readonly ConcurrentQueue<ConfirmsAwareChannel> channels;
         IConnection connection;
 

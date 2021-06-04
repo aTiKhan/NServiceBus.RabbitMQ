@@ -47,18 +47,23 @@ namespace NServiceBus.Transport.RabbitMQ.AcceptanceTests
             public OriginatingEndpoint()
             {
                 EndpointSetup<DefaultServer>(config =>
-                    config.ConfigureTransport().Routing().RouteToEndpoint(typeof(Request), typeof(ReceivingEndpoint)));
+                    config.ConfigureRouting().RouteToEndpoint(typeof(Request), typeof(ReceivingEndpoint)));
             }
 
             class ReplyHandler : IHandleMessages<Reply>
             {
-                public MyContext Context { get; set; }
+                MyContext testContext;
+
+                public ReplyHandler(MyContext testContext)
+                {
+                    this.testContext = testContext;
+                }
 
                 public Task Handle(Reply message, IMessageHandlerContext context)
                 {
-                    Context.RepliedToWrongQueue = true;
-                    Context.Done = true;
-                    return TaskEx.CompletedTask;
+                    testContext.RepliedToWrongQueue = true;
+                    testContext.Done = true;
+                    return Task.CompletedTask;
                 }
             }
         }
@@ -72,12 +77,17 @@ namespace NServiceBus.Transport.RabbitMQ.AcceptanceTests
 
             class ReplyHandler : IHandleMessages<Reply>
             {
-                public MyContext Context { get; set; }
+                MyContext testContext;
+
+                public ReplyHandler(MyContext testContext)
+                {
+                    this.testContext = testContext;
+                }
 
                 public Task Handle(Reply message, IMessageHandlerContext context)
                 {
-                    Context.Done = true;
-                    return TaskEx.CompletedTask;
+                    testContext.Done = true;
+                    return Task.CompletedTask;
                 }
             }
         }

@@ -10,135 +10,159 @@
     using global::RabbitMQ.Client.Exceptions;
     using Logging;
 
-    sealed class MessagePump : IPushMessages, IDisposable
+    sealed class MessagePump : IMessageReceiver, IDisposable
     {
         static readonly ILog Logger = LogManager.GetLogger(typeof(MessagePump));
-        static readonly TransportTransaction transportTransaction = new TransportTransaction();
+        static readonly TransportTransaction TransportTransaction = new TransportTransaction();
 
         readonly ConnectionFactory connectionFactory;
         readonly MessageConverter messageConverter;
         readonly string consumerTag;
         readonly ChannelProvider channelProvider;
-        readonly QueuePurger queuePurger;
         readonly TimeSpan timeToWaitBeforeTriggeringCircuitBreaker;
-        readonly int prefetchMultiplier;
-        readonly ushort overriddenPrefetchCount;
+        readonly QueuePurger queuePurger;
+        readonly PrefetchCountCalculation prefetchCountCalculation;
+        readonly ReceiveSettings settings;
+        readonly Action<string, Exception, CancellationToken> criticalErrorAction;
 
-        // Init
-        Func<MessageContext, Task> onMessage;
-        Func<ErrorContext, Task<ErrorHandleResult>> onError;
-        PushSettings settings;
-        CriticalError criticalError;
-        MessagePumpConnectionFailedCircuitBreaker circuitBreaker;
-        TaskScheduler exclusiveScheduler;
-
-        // Start
+        bool disposed;
+        OnMessage onMessage;
+        OnError onError;
         int maxConcurrency;
-        SemaphoreSlim semaphore;
-        CancellationTokenSource messageProcessing;
+        long numberOfMessagesBeingProcessed;
+        CancellationTokenSource messagePumpCancellationTokenSource;
+        CancellationTokenSource messageProcessingCancellationTokenSource;
+        MessagePumpConnectionFailedCircuitBreaker circuitBreaker;
         IConnection connection;
-        EventingBasicConsumer consumer;
+        AsyncEventingBasicConsumer consumer;
 
         // Stop
         TaskCompletionSource<bool> connectionShutdownCompleted;
 
-        public MessagePump(ConnectionFactory connectionFactory, MessageConverter messageConverter, string consumerTag, ChannelProvider channelProvider, QueuePurger queuePurger, TimeSpan timeToWaitBeforeTriggeringCircuitBreaker, int prefetchMultiplier, ushort overriddenPrefetchCount)
+        public MessagePump(ConnectionFactory connectionFactory, IRoutingTopology routingTopology, MessageConverter messageConverter, string consumerTag,
+            ChannelProvider channelProvider, TimeSpan timeToWaitBeforeTriggeringCircuitBreaker,
+            PrefetchCountCalculation prefetchCountCalculation, ReceiveSettings settings,
+            Action<string, Exception, CancellationToken> criticalErrorAction)
         {
             this.connectionFactory = connectionFactory;
             this.messageConverter = messageConverter;
             this.consumerTag = consumerTag;
             this.channelProvider = channelProvider;
-            this.queuePurger = queuePurger;
             this.timeToWaitBeforeTriggeringCircuitBreaker = timeToWaitBeforeTriggeringCircuitBreaker;
-            this.prefetchMultiplier = prefetchMultiplier;
-            this.overriddenPrefetchCount = overriddenPrefetchCount;
+            this.prefetchCountCalculation = prefetchCountCalculation;
+            this.settings = settings;
+            this.criticalErrorAction = criticalErrorAction;
+
+            if (settings.UsePublishSubscribe)
+            {
+                Subscriptions = new SubscriptionManager(connectionFactory, routingTopology, settings.ReceiveAddress);
+            }
+
+            queuePurger = new QueuePurger(connectionFactory);
         }
 
-        public Task Init(Func<MessageContext, Task> onMessage, Func<ErrorContext, Task<ErrorHandleResult>> onError, CriticalError criticalError, PushSettings settings)
+        public ISubscriptionManager Subscriptions { get; }
+        public string Id => settings.Id;
+
+        public Task Initialize(PushRuntimeSettings limitations, OnMessage onMessage, OnError onError, CancellationToken cancellationToken = default)
         {
             this.onMessage = onMessage;
             this.onError = onError;
-            this.settings = settings;
-            this.criticalError = criticalError;
-
-            circuitBreaker = new MessagePumpConnectionFailedCircuitBreaker($"'{settings.InputQueue} MessagePump'", timeToWaitBeforeTriggeringCircuitBreaker, criticalError);
-
-            exclusiveScheduler = new ConcurrentExclusiveSchedulerPair().ExclusiveScheduler;
+            maxConcurrency = limitations.MaxConcurrency;
 
             if (settings.PurgeOnStartup)
             {
-                queuePurger.Purge(settings.InputQueue);
+                queuePurger.Purge(settings.ReceiveAddress);
             }
 
-            return TaskEx.CompletedTask;
+            return Task.CompletedTask;
         }
 
-        public void Start(PushRuntimeSettings limitations)
+        public Task StartReceive(CancellationToken cancellationToken = default)
         {
-            maxConcurrency = limitations.MaxConcurrency;
-            semaphore = new SemaphoreSlim(limitations.MaxConcurrency, limitations.MaxConcurrency);
-            messageProcessing = new CancellationTokenSource();
+            messagePumpCancellationTokenSource = new CancellationTokenSource();
+            messageProcessingCancellationTokenSource = new CancellationTokenSource();
 
-            connection = connectionFactory.CreateConnection($"{settings.InputQueue} MessagePump");
+            circuitBreaker = new MessagePumpConnectionFailedCircuitBreaker(
+                $"'{settings.ReceiveAddress} MessagePump'",
+                timeToWaitBeforeTriggeringCircuitBreaker,
+                (message, exception) => criticalErrorAction(message, exception, messageProcessingCancellationTokenSource.Token));
+
+            connection = connectionFactory.CreateConnection($"{settings.ReceiveAddress} MessagePump", consumerDispatchConcurrency: maxConcurrency);
 
             var channel = connection.CreateModel();
 
-            long prefetchCount;
+            var prefetchCount = prefetchCountCalculation(maxConcurrency);
 
-            if (overriddenPrefetchCount > 0)
+            if (prefetchCount < maxConcurrency)
             {
-                prefetchCount = overriddenPrefetchCount;
-
-                if (prefetchCount < maxConcurrency)
-                {
-                    Logger.Warn($"The specified prefetch count '{prefetchCount}' is smaller than the specified maximum concurrency '{maxConcurrency}'. The maximum concurrency value will be used as the prefetch count instead.");
-                    prefetchCount = maxConcurrency;
-                }
-            }
-            else
-            {
-                prefetchCount = (long)maxConcurrency * prefetchMultiplier;
+                Logger.Warn($"The specified prefetch count '{prefetchCount}' is smaller than the specified maximum concurrency '{maxConcurrency}'. The maximum concurrency value will be used as the prefetch count instead.");
+                prefetchCount = maxConcurrency;
             }
 
             channel.BasicQos(0, (ushort)Math.Min(prefetchCount, ushort.MaxValue), false);
 
-            consumer = new EventingBasicConsumer(channel);
+            consumer = new AsyncEventingBasicConsumer(channel);
 
             consumer.Registered += Consumer_Registered;
             connection.ConnectionShutdown += Connection_ConnectionShutdown;
 
             consumer.Received += Consumer_Received;
 
-            channel.BasicConsume(settings.InputQueue, false, consumerTag, consumer);
+            channel.BasicConsume(settings.ReceiveAddress, false, consumerTag, consumer);
+
+            return Task.CompletedTask;
         }
 
-        public async Task Stop()
+        public async Task StopReceive(CancellationToken cancellationToken = default)
         {
             consumer.Received -= Consumer_Received;
-            messageProcessing.Cancel();
 
-            while (semaphore.CurrentCount != maxConcurrency)
+            messagePumpCancellationTokenSource?.Cancel();
+
+            using (cancellationToken.Register(() => messageProcessingCancellationTokenSource?.Cancel()))
             {
-                await Task.Delay(50).ConfigureAwait(false);
-            }
 
-            connectionShutdownCompleted = new TaskCompletionSource<bool>();
+                while (Interlocked.Read(ref numberOfMessagesBeingProcessed) > 0)
+                {
+                    // We are deliberately not forwarding the cancellation token here because
+                    // this loop is our way of waiting for all pending messaging operations
+                    // to participate in cooperative cancellation or not.
+                    // We do not want to rudely abort them because the cancellation token has been canceled.
+                    // This allows us to preserve the same behaviour in v8 as in v7 in that,
+                    // if CancellationToken.None is passed to this method,
+                    // the method will only return when all in flight messages have been processed.
+                    // If, on the other hand, a non-default CancellationToken is passed,
+                    // all message processing operations have the opportunity to
+                    // participate in cooperative cancellation.
+                    // If we ever require a method of stopping the endpoint such that
+                    // all message processing is canceled immediately,
+                    // we can provide that as a separate feature.
+                    await Task.Delay(50, CancellationToken.None).ConfigureAwait(false);
+                }
 
-            if (connection.IsOpen)
-            {
-                connection.Close();
-            }
-            else
-            {
-                connectionShutdownCompleted.SetResult(true);
-            }
+                connectionShutdownCompleted = new TaskCompletionSource<bool>();
 
-            await connectionShutdownCompleted.Task.ConfigureAwait(false);
+                if (connection.IsOpen)
+                {
+                    connection.Close();
+                }
+                else
+                {
+                    connectionShutdownCompleted.SetResult(true);
+                }
+
+                await connectionShutdownCompleted.Task.ConfigureAwait(false);
+            }
         }
 
-        void Consumer_Registered(object sender, ConsumerEventArgs e)
+#pragma warning disable PS0018 // A task-returning method should have a CancellationToken parameter unless it has a parameter implementing ICancellableContext
+        Task Consumer_Registered(object sender, ConsumerEventArgs e)
+#pragma warning restore PS0018 // A task-returning method should have a CancellationToken parameter unless it has a parameter implementing ICancellableContext
         {
             circuitBreaker.Success();
+
+            return Task.CompletedTask;
         }
 
         void Connection_ConnectionShutdown(object sender, ShutdownEventArgs e)
@@ -153,59 +177,52 @@
             }
         }
 
-        async void Consumer_Received(object sender, BasicDeliverEventArgs eventArgs)
+#pragma warning disable PS0018 // A task-returning method should have a CancellationToken parameter unless it has a parameter implementing ICancellableContext
+        async Task Consumer_Received(object sender, BasicDeliverEventArgs eventArgs)
+#pragma warning restore PS0018 // A task-returning method should have a CancellationToken parameter unless it has a parameter implementing ICancellableContext
         {
-            var eventRaisingThreadId = Thread.CurrentThread.ManagedThreadId;
-
-            try
-            {
-                await semaphore.WaitAsync(messageProcessing.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
+            if (messagePumpCancellationTokenSource.IsCancellationRequested)
             {
                 return;
             }
 
+            await ProcessAndSwallowExceptions(eventArgs, messageProcessingCancellationTokenSource.Token).ConfigureAwait(false);
+        }
+
+        async Task ProcessAndSwallowExceptions(BasicDeliverEventArgs message, CancellationToken messageProcessingCancellationToken)
+        {
+            Interlocked.Increment(ref numberOfMessagesBeingProcessed);
+
             try
             {
-                // The current thread will be the event-raising thread if either:
-                //
-                // a) the semaphore was entered synchronously (did not have to wait).
-                // b) the event was raised on a thread pool thread,
-                //    and the semaphore was entered asynchronously (had to wait),
-                //    and the continuation happened to be scheduled back onto the same thread.
-                if (Thread.CurrentThread.ManagedThreadId == eventRaisingThreadId)
+                try
                 {
-                    // In RabbitMQ.Client 4.1.0, the event is raised by reusing a single, explicitly created thread,
-                    // so we are in scenario (a) described above.
-                    // We must yield to allow the thread to raise more events while we handle this one,
-                    // otherwise we will never process messages concurrently.
-                    //
-                    // If a future version of RabbitMQ.Client changes its threading model, then either:
-                    //
-                    // 1) we are in scenario (a), but we *may not* need to yield.
-                    //    E.g. the client may raise the event on a new, explicitly created thread each time.
-                    // 2) we cannot tell whether we are in scenario (a) or scenario (b).
-                    //    E.g. the client may raise the event on a thread pool thread.
-                    //
-                    // In both cases, we cannot tell whether we need to yield or not, so we must yield.
-                    await Task.Yield();
+                    await Process(message, messageProcessingCancellationToken).ConfigureAwait(false);
                 }
-
-                await Process(eventArgs).ConfigureAwait(false);
+#pragma warning disable PS0019 // Do not catch Exception without considering OperationCanceledException - handling is the same for OCE
+                catch (Exception ex)
+#pragma warning restore PS0019 // Do not catch Exception without considering OperationCanceledException
+                {
+                    Logger.Debug("Returning message to queue...", ex);
+                    consumer.Model.BasicRejectAndRequeueIfOpen(message.DeliveryTag);
+                    throw;
+                }
+            }
+            catch (Exception ex) when (ex.IsCausedBy(messageProcessingCancellationToken))
+            {
+                Logger.Debug("Message processing canceled.", ex);
             }
             catch (Exception ex)
             {
-                Logger.Warn("Failed to process message. Returning message to queue...", ex);
-                await consumer.Model.BasicRejectAndRequeueIfOpen(eventArgs.DeliveryTag, exclusiveScheduler).ConfigureAwait(false);
+                Logger.Error("Message processing failed.", ex);
             }
             finally
             {
-                semaphore.Release();
+                Interlocked.Decrement(ref numberOfMessagesBeingProcessed);
             }
         }
 
-        async Task Process(BasicDeliverEventArgs message)
+        async Task Process(BasicDeliverEventArgs message, CancellationToken messageProcessingCancellationToken)
         {
             Dictionary<string, string> headers;
 
@@ -215,8 +232,10 @@
             }
             catch (Exception ex)
             {
-                Logger.Error($"Failed to retrieve headers from poison message. Moving message to queue '{settings.ErrorQueue}'...", ex);
-                await MovePoisonMessage(message, settings.ErrorQueue).ConfigureAwait(false);
+                Logger.Error(
+                    $"Failed to retrieve headers from poison message. Moving message to queue '{settings.ErrorQueue}'...",
+                    ex);
+                await MovePoisonMessage(message, settings.ErrorQueue, messageProcessingCancellationToken).ConfigureAwait(false);
 
                 return;
             }
@@ -229,77 +248,79 @@
             }
             catch (Exception ex)
             {
-                Logger.Error($"Failed to retrieve ID from poison message. Moving message to queue '{settings.ErrorQueue}'...", ex);
-                await MovePoisonMessage(message, settings.ErrorQueue).ConfigureAwait(false);
+                Logger.Error(
+                    $"Failed to retrieve ID from poison message. Moving message to queue '{settings.ErrorQueue}'...",
+                    ex);
+                await MovePoisonMessage(message, settings.ErrorQueue, messageProcessingCancellationToken).ConfigureAwait(false);
 
                 return;
             }
 
-            using (var tokenSource = new CancellationTokenSource())
+            var processed = false;
+            var errorHandled = false;
+            var numberOfDeliveryAttempts = 0;
+            var messageBody = message.Body.ToArray();
+
+            while (!processed && !errorHandled)
             {
-                var processed = false;
-                var errorHandled = false;
-                var numberOfDeliveryAttempts = 0;
+                var processingContext = new ContextBag();
 
-                while (!processed && !errorHandled)
+                processingContext.Set(message);
+
+                try
                 {
+
+                    var messageContext = new MessageContext(messageId, headers, messageBody ?? Array.Empty<byte>(),
+                        TransportTransaction, processingContext);
+
+                    await onMessage(messageContext, messageProcessingCancellationToken).ConfigureAwait(false);
+                    processed = true;
+                }
+                catch (Exception ex) when (!ex.IsCausedBy(messageProcessingCancellationToken))
+                {
+                    ++numberOfDeliveryAttempts;
+                    headers = messageConverter.RetrieveHeaders(message);
+
+                    var errorContext = new ErrorContext(ex, headers, messageId,
+                        messageBody ?? Array.Empty<byte>(), TransportTransaction, numberOfDeliveryAttempts,
+                        processingContext);
+
                     try
                     {
-                        var contextBag = new ContextBag();
-                        contextBag.Set(message);
+                        errorHandled =
+                            await onError(errorContext, messageProcessingCancellationToken).ConfigureAwait(false) ==
+                            ErrorHandleResult.Handled;
 
-                        var messageContext = new MessageContext(messageId, headers, message.Body ?? new byte[0], transportTransaction, tokenSource, contextBag);
-
-                        await onMessage(messageContext).ConfigureAwait(false);
-                        processed = true;
-                    }
-                    catch (Exception exception)
-                    {
-                        ++numberOfDeliveryAttempts;
-                        headers = messageConverter.RetrieveHeaders(message);
-                        var contextBag = new ContextBag();
-                        contextBag.Set(message);
-
-                        var errorContext = new ErrorContext(exception, headers, messageId, message.Body ?? new byte[0], transportTransaction, numberOfDeliveryAttempts, contextBag);
-
-                        try
+                        if (!errorHandled)
                         {
-                            errorHandled = await onError(errorContext).ConfigureAwait(false) == ErrorHandleResult.Handled;
-
-                            if (!errorHandled)
-                            {
-                                headers = messageConverter.RetrieveHeaders(message);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            criticalError.Raise($"Failed to execute recoverability policy for message with native ID: `{messageId}`", ex);
-                            await consumer.Model.BasicRejectAndRequeueIfOpen(message.DeliveryTag, exclusiveScheduler).ConfigureAwait(false);
-
-                            return;
+                            headers = messageConverter.RetrieveHeaders(message);
                         }
                     }
-                }
+                    catch (Exception onErrorEx) when (!onErrorEx.IsCausedBy(messageProcessingCancellationToken))
+                    {
+                        criticalErrorAction(
+                            $"Failed to execute recoverability policy for message with native ID: `{messageId}`", onErrorEx,
+                            messageProcessingCancellationToken);
+                        consumer.Model.BasicRejectAndRequeueIfOpen(message.DeliveryTag);
 
-                if (processed && tokenSource.IsCancellationRequested)
-                {
-                    await consumer.Model.BasicRejectAndRequeueIfOpen(message.DeliveryTag, exclusiveScheduler).ConfigureAwait(false);
-                }
-                else
-                {
-                    try
-                    {
-                        await consumer.Model.BasicAckSingle(message.DeliveryTag, exclusiveScheduler).ConfigureAwait(false);
-                    }
-                    catch (AlreadyClosedException ex)
-                    {
-                        Logger.Warn($"Failed to acknowledge message '{messageId}' because the channel was closed. The message was returned to the queue.", ex);
+                        return;
                     }
                 }
             }
+
+            try
+            {
+                consumer.Model.BasicAckSingle(message.DeliveryTag);
+            }
+            catch (AlreadyClosedException ex)
+            {
+                Logger.Warn(
+                    $"Failed to acknowledge message '{messageId}' because the channel was closed. The message was returned to the queue.",
+                    ex);
+            }
         }
 
-        async Task MovePoisonMessage(BasicDeliverEventArgs message, string queue)
+        async Task MovePoisonMessage(BasicDeliverEventArgs message, string queue, CancellationToken messageProcessingCancellationToken)
         {
             try
             {
@@ -307,24 +328,24 @@
 
                 try
                 {
-                    await channel.RawSendInCaseOfFailure(queue, message.Body, message.BasicProperties).ConfigureAwait(false);
+                    await channel.RawSendInCaseOfFailure(queue, message.Body, message.BasicProperties, messageProcessingCancellationToken).ConfigureAwait(false);
                 }
                 finally
                 {
                     channelProvider.ReturnPublishChannel(channel);
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!ex.IsCausedBy(messageProcessingCancellationToken))
             {
                 Logger.Error($"Failed to move poison message to queue '{queue}'. Returning message to original queue...", ex);
-                await consumer.Model.BasicRejectAndRequeueIfOpen(message.DeliveryTag, exclusiveScheduler).ConfigureAwait(false);
+                consumer.Model.BasicRejectAndRequeueIfOpen(message.DeliveryTag);
 
                 return;
             }
 
             try
             {
-                await consumer.Model.BasicAckSingle(message.DeliveryTag, exclusiveScheduler).ConfigureAwait(false);
+                consumer.Model.BasicAckSingle(message.DeliveryTag);
             }
             catch (AlreadyClosedException ex)
             {
@@ -334,10 +355,16 @@
 
         public void Dispose()
         {
+            if (disposed)
+            {
+                return;
+            }
             circuitBreaker?.Dispose();
-            semaphore?.Dispose();
-            messageProcessing?.Dispose();
+            messagePumpCancellationTokenSource?.Dispose();
+            messageProcessingCancellationTokenSource?.Dispose();
+
             connection?.Dispose();
+            disposed = true;
         }
     }
 }

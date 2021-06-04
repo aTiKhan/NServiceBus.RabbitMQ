@@ -1,20 +1,19 @@
 ﻿using System;
-using System.Data.Common;
-using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using NServiceBus;
-using NServiceBus.Settings;
 using NServiceBus.Transport;
 using NServiceBus.TransportTests;
-using RabbitMQ.Client;
+
+// Workaround to prevent errors because scanning expects this type to exist
+class ConfigureRabbitMQClusterTransportInfrastructure : ConfigureRabbitMQTransportInfrastructure
+{
+}
 
 class ConfigureRabbitMQTransportInfrastructure : IConfigureTransportInfrastructure
 {
-    public TransportConfigurationResult Configure(SettingsHolder settings, TransportTransactionMode transactionMode)
+    public TransportDefinition CreateTransportDefinition()
     {
-        var result = new TransportConfigurationResult();
-        var transport = new RabbitMQTransport();
-
         var connectionString = Environment.GetEnvironmentVariable("RabbitMQTransport_ConnectionString");
 
         if (string.IsNullOrEmpty(connectionString))
@@ -22,74 +21,36 @@ class ConfigureRabbitMQTransportInfrastructure : IConfigureTransportInfrastructu
             throw new Exception("The 'RabbitMQTransport_ConnectionString' environment variable is not set.");
         }
 
-        connectionStringBuilder = new DbConnectionStringBuilder { ConnectionString = connectionString };
+        var transport = new RabbitMQTransport(Topology.Conventional, connectionString);
 
-        queueBindings = settings.Get<QueueBindings>();
-
-        new TransportExtensions<RabbitMQTransport>(settings).UseConventionalRoutingTopology();
-        result.TransportInfrastructure = transport.Initialize(settings, connectionStringBuilder.ConnectionString);
-        isTransportInitialized = true;
-        result.PurgeInputQueueOnStartup = true;
-
-        transportTransactionMode = result.TransportInfrastructure.TransactionMode;
-        requestedTransactionMode = transactionMode;
-
-        return result;
+        return transport;
     }
 
-    public Task Cleanup()
+    public Task<TransportInfrastructure> Configure(TransportDefinition transportDefinition, HostSettings hostSettings, string inputQueueName,
+        string errorQueueName, CancellationToken cancellationToken = default)
     {
-        if (isTransportInitialized && transportTransactionMode >= requestedTransactionMode)
-        {
-            PurgeQueues(connectionStringBuilder, queueBindings);
-        }
+        queuesToCleanUp = new[] { inputQueueName, errorQueueName };
 
-        return Task.FromResult(0);
+        var mainReceiverSettings = new ReceiveSettings(
+            "mainReceiver",
+            inputQueueName,
+            true,
+            true, errorQueueName);
+
+        return transportDefinition.Initialize(hostSettings, new[] { mainReceiverSettings }, new[] { errorQueueName }, cancellationToken);
     }
 
-    static void PurgeQueues(DbConnectionStringBuilder connectionStringBuilder, QueueBindings queueBindings)
+    public Task Cleanup(CancellationToken cancellationToken = default)
     {
-        if (connectionStringBuilder == null)
+        if (queuesToCleanUp == null)
         {
-            return;
+            return Task.CompletedTask;
         }
 
-        var connectionFactory = new ConnectionFactory
-        {
-            AutomaticRecoveryEnabled = true,
-            UseBackgroundThreadsForIO = true
-        };
-
-        if (connectionStringBuilder.TryGetValue("username", out var value))
-        {
-            connectionFactory.UserName = value.ToString();
-        }
-
-        if (connectionStringBuilder.TryGetValue("password", out value))
-        {
-            connectionFactory.Password = value.ToString();
-        }
-
-        if (connectionStringBuilder.TryGetValue("virtualhost", out value))
-        {
-            connectionFactory.VirtualHost = value.ToString();
-        }
-
-        if (connectionStringBuilder.TryGetValue("host", out value))
-        {
-            connectionFactory.HostName = value.ToString();
-        }
-        else
-        {
-            throw new Exception("The connection string doesn't contain a value for 'host'.");
-        }
-
-        var queues = queueBindings.ReceivingAddresses.Concat(queueBindings.SendingAddresses);
-
-        using (var connection = connectionFactory.CreateConnection("Test Queue Purger"))
+        using (var connection = ConnectionHelper.ConnectionFactory.CreateConnection("Test Queue Purger"))
         using (var channel = connection.CreateModel())
         {
-            foreach (var queue in queues)
+            foreach (var queue in queuesToCleanUp)
             {
                 try
                 {
@@ -101,12 +62,8 @@ class ConfigureRabbitMQTransportInfrastructure : IConfigureTransportInfrastructu
                 }
             }
         }
+        return Task.CompletedTask;
     }
 
-    DbConnectionStringBuilder connectionStringBuilder;
-    QueueBindings queueBindings;
-    TransportTransactionMode transportTransactionMode;
-    TransportTransactionMode requestedTransactionMode;
-    bool isTransportInitialized;
+    string[] queuesToCleanUp;
 }
-

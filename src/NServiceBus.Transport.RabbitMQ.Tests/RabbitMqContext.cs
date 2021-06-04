@@ -6,16 +6,14 @@
     using System.Linq;
     using System.Threading.Tasks;
     using NUnit.Framework;
-    using Support;
 
     class RabbitMqContext
     {
         public virtual int MaximumConcurrency => 1;
 
         [SetUp]
-        public void SetUp()
+        public async Task SetUp()
         {
-            routingTopology = new ConventionalRoutingTopology(true);
             receivedMessages = new BlockingCollection<IncomingMessage>();
 
             var connectionString = Environment.GetEnvironmentVariable("RabbitMQTransport_ConnectionString");
@@ -25,50 +23,57 @@
                 throw new Exception("The 'RabbitMQTransport_ConnectionString' environment variable is not set.");
             }
 
-            var config = ConnectionConfiguration.Create(connectionString, ReceiverQueue);
+            var useTls = connectionString.StartsWith("https", StringComparison.InvariantCultureIgnoreCase) || connectionString.StartsWith("amqps", StringComparison.InvariantCultureIgnoreCase);
 
-            connectionFactory = new ConnectionFactory(ReceiverQueue, config,  default, false, false, default, default);
-            channelProvider = new ChannelProvider(connectionFactory, config.RetryDelay, routingTopology, true);
-            channelProvider.CreateConnection();
+            var transport = new RabbitMQTransport(Topology.Conventional, connectionString);
 
-            messageDispatcher = new MessageDispatcher(channelProvider);
+            connectionFactory = new ConnectionFactory(ReceiverQueue, transport.Host, transport.Port ?? 5672,
+                transport.VHost, transport.UserName, transport.Password, useTls, null, false,
+                false, transport.HeartbeatInterval, transport.NetworkRecoveryInterval, null);
 
-            var purger = new QueuePurger(connectionFactory);
-
-            messagePump = new MessagePump(connectionFactory, new MessageConverter(), "Unit test", channelProvider, purger, TimeSpan.FromMinutes(2), 3, 0);
-
-            routingTopology.Reset(connectionFactory, new[] { ReceiverQueue }.Concat(AdditionalReceiverQueues), new[] { ErrorQueue });
-
-            subscriptionManager = new SubscriptionManager(connectionFactory, routingTopology, ReceiverQueue);
-
-            messagePump.Init(messageContext =>
+            infra = await transport.Initialize(new HostSettings(ReceiverQueue, ReceiverQueue, new StartupDiagnosticEntries(),
+                (_, __, ___) => { }, true), new[]
             {
-                receivedMessages.Add(new IncomingMessage(messageContext.MessageId, messageContext.Headers, messageContext.Body));
-                return TaskEx.CompletedTask;
-            },
-                ErrorContext => Task.FromResult(ErrorHandleResult.Handled),
-                new CriticalError(_ => TaskEx.CompletedTask),
-                new PushSettings(ReceiverQueue, ErrorQueue, true, TransportTransactionMode.ReceiveOnly)
-            ).GetAwaiter().GetResult();
+                new ReceiveSettings(ReceiverQueue, ReceiverQueue, true, true, "error")
+            }, AdditionalReceiverQueues.Concat(new[] { ErrorQueue }).ToArray());
 
-            messagePump.Start(new PushRuntimeSettings(MaximumConcurrency));
+            messageDispatcher = infra.Dispatcher;
+            messagePump = infra.Receivers[ReceiverQueue];
+            subscriptionManager = messagePump.Subscriptions;
+
+            await messagePump.Initialize(new PushRuntimeSettings(MaximumConcurrency),
+                (messageContext, cancellationToken) =>
+                {
+                    receivedMessages.Add(new IncomingMessage(messageContext.NativeMessageId, messageContext.Headers,
+                        messageContext.Body), cancellationToken);
+                    return Task.CompletedTask;
+                }, (_, __) => Task.FromResult(ErrorHandleResult.Handled)
+            );
+
+            await messagePump.StartReceive();
         }
 
         [TearDown]
-        public void TearDown()
+        public async Task TearDown()
         {
-            messagePump?.Stop().GetAwaiter().GetResult();
+            if (messagePump != null)
+            {
+                await messagePump.StopReceive();
+            }
 
-            channelProvider?.Dispose();
+            if (infra != null)
+            {
+                await infra.Shutdown();
+            }
         }
 
-        protected bool TryWaitForMessageReceipt() => TryReceiveMessage(out var _, incomingMessageTimeout);
+        protected bool TryWaitForMessageReceipt() => TryReceiveMessage(out var _, IncomingMessageTimeout);
 
         protected IncomingMessage ReceiveMessage()
         {
-            if (!TryReceiveMessage(out var message, incomingMessageTimeout))
+            if (!TryReceiveMessage(out var message, IncomingMessageTimeout))
             {
-                throw new TimeoutException($"The message did not arrive within {incomingMessageTimeout.TotalSeconds} seconds.");
+                throw new TimeoutException($"The message did not arrive within {IncomingMessageTimeout.TotalSeconds} seconds.");
             }
 
             return message;
@@ -81,15 +86,14 @@
 
         protected const string ReceiverQueue = "testreceiver";
         protected const string ErrorQueue = "error";
-        protected MessageDispatcher messageDispatcher;
         protected ConnectionFactory connectionFactory;
-        protected MessagePump messagePump;
-        protected SubscriptionManager subscriptionManager;
+        protected IMessageDispatcher messageDispatcher;
+        protected IMessageReceiver messagePump;
+        protected ISubscriptionManager subscriptionManager;
 
-        ChannelProvider channelProvider;
         BlockingCollection<IncomingMessage> receivedMessages;
-        ConventionalRoutingTopology routingTopology;
 
-        static readonly TimeSpan incomingMessageTimeout = TimeSpan.FromSeconds(1);
+        static readonly TimeSpan IncomingMessageTimeout = TimeSpan.FromSeconds(1);
+        TransportInfrastructure infra;
     }
 }

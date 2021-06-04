@@ -24,19 +24,24 @@
         {
             public Receiver()
             {
-                EndpointSetup<DefaultServer>(c => c.UseTransport<RabbitMQTransport>());
+                EndpointSetup<DefaultServer>();
             }
 
             class MyEventHandler : IHandleMessages<Message>
             {
-                public Context Context { get; set; }
+                Context testContext;
+
+                public MyEventHandler(Context testContext)
+                {
+                    this.testContext = testContext;
+                }
 
                 public Task Handle(Message message, IMessageHandlerContext context)
                 {
-                    Context.HandlerHasAccessToBasicDeliverEventArgs = context.Extensions.TryGet<BasicDeliverEventArgs>(out _);
-                    Context.MessageReceived = true;
+                    testContext.HandlerHasAccessToBasicDeliverEventArgs = context.Extensions.TryGet<BasicDeliverEventArgs>(out _);
+                    testContext.MessageReceived = true;
 
-                    return TaskEx.CompletedTask;
+                    return Task.CompletedTask;
                 }
             }
         }

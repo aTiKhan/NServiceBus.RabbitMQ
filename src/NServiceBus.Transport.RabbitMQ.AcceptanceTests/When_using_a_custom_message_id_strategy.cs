@@ -2,10 +2,11 @@
 {
     using System.Collections.Generic;
     using System.Text;
+    using System.Threading;
     using System.Threading.Tasks;
     using AcceptanceTesting;
-    using Extensibility;
     using Features;
+    using Microsoft.Extensions.DependencyInjection;
     using NServiceBus.AcceptanceTests;
     using NServiceBus.AcceptanceTests.EndpointTemplates;
     using NUnit.Framework;
@@ -14,7 +15,7 @@
 
     public class When_using_a_custom_message_id_strategy : NServiceBusAcceptanceTest
     {
-        const string customMessageId = "CustomMessageId";
+        const string CustomMessageId = "CustomMessageId";
 
         [Test]
         public async Task Should_use_custom_strategy_to_set_message_id_on_message_with_no_id()
@@ -25,7 +26,7 @@
                    .Run();
 
             Assert.True(context.GotTheMessage, "Should receive the message");
-            Assert.AreEqual(context.ReceivedMessageId, customMessageId, "Message id should equal custom id value");
+            Assert.AreEqual(context.ReceivedMessageId, CustomMessageId, "Message id should equal custom id value");
         }
 
         public class Receiver : EndpointConfigurationBuilder
@@ -35,8 +36,7 @@
                 EndpointSetup<DefaultServer>(c =>
                 {
                     c.EnableFeature<StarterFeature>();
-                    c.UseTransport<RabbitMQTransport>()
-                        .CustomMessageIdStrategy(m => customMessageId);
+                    c.ConfigureRabbitMQTransport().MessageIdStrategy = m => CustomMessageId;
                 });
             }
 
@@ -44,22 +44,21 @@
             {
                 protected override void Setup(FeatureConfigurationContext context)
                 {
-                    context.Container.ConfigureComponent<Starter>(DependencyLifecycle.InstancePerCall);
-                    context.RegisterStartupTask(b => b.Build<Starter>());
+                    context.Services.AddTransient<Starter>();
+                    context.RegisterStartupTask(b => b.GetRequiredService<Starter>());
                 }
 
                 class Starter : FeatureStartupTask
                 {
-                    public Starter(IDispatchMessages dispatchMessages, ReadOnlySettings settings)
+                    public Starter(IMessageDispatcher dispatchMessages, ReadOnlySettings settings)
                     {
                         this.dispatchMessages = dispatchMessages;
                         this.settings = settings;
                     }
 
-                    protected override Task OnStart(IMessageSession session)
+                    protected override Task OnStart(IMessageSession session, CancellationToken cancellationToken = default)
                     {
                         //Use feature to send message that has no message id
-
                         var messageBody = "<MyRequest></MyRequest>";
 
                         var message = new OutgoingMessage(
@@ -71,12 +70,12 @@
                             Encoding.UTF8.GetBytes(messageBody));
 
                         var transportOperation = new TransportOperation(message, new UnicastAddressTag(settings.EndpointName()));
-                        return dispatchMessages.Dispatch(new TransportOperations(transportOperation), new TransportTransaction(), new ContextBag());
+                        return dispatchMessages.Dispatch(new TransportOperations(transportOperation), new TransportTransaction(), cancellationToken);
                     }
 
-                    protected override Task OnStop(IMessageSession session) => TaskEx.CompletedTask;
+                    protected override Task OnStop(IMessageSession session, CancellationToken cancellationToken = default) => Task.CompletedTask;
 
-                    readonly IDispatchMessages dispatchMessages;
+                    readonly IMessageDispatcher dispatchMessages;
                     readonly ReadOnlySettings settings;
                 }
             }
@@ -95,7 +94,7 @@
                     myContext.GotTheMessage = true;
                     myContext.ReceivedMessageId = context.MessageId;
 
-                    return TaskEx.CompletedTask;
+                    return Task.CompletedTask;
                 }
             }
         }

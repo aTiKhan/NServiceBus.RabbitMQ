@@ -3,7 +3,6 @@
     using System;
     using System.Collections.Generic;
     using System.Threading.Tasks;
-    using Extensibility;
     using NUnit.Framework;
     using Routing;
 
@@ -16,7 +15,7 @@
             var message = new OutgoingMessage(Guid.NewGuid().ToString(), new Dictionary<string, string>(), new byte[0]);
             var transportOperations = new TransportOperations(new TransportOperation(message, new UnicastAddressTag(ReceiverQueue)));
 
-            await messageDispatcher.Dispatch(transportOperations, new TransportTransaction(), new ContextBag());
+            await messageDispatcher.Dispatch(transportOperations, new TransportTransaction());
 
             var receivedMessage = ReceiveMessage();
 

@@ -1,8 +1,11 @@
-﻿namespace NServiceBus.Transport.RabbitMQ.Tests
+﻿
+namespace NServiceBus.Transport.RabbitMQ.Tests
 {
+    using System.Threading;
     using System.Threading.Tasks;
     using Extensibility;
     using NUnit.Framework;
+    using Unicast.Messages;
 
     [TestFixture]
     class When_subscribed_to_a_event : RabbitMqContext
@@ -44,17 +47,17 @@
         {
             await Subscribe<IMyEvent>();
 
-            await Publish<MyEvent1>();
-            await Publish<MyEvent2>();
+            await Publish<IMyEvent1>();
+            await Publish<IMyEvent2>();
 
-            AssertReceived<MyEvent1>();
-            AssertReceived<MyEvent2>();
+            AssertReceived<IMyEvent1>();
+            AssertReceived<IMyEvent2>();
         }
 
         [Test]
         public async Task Should_not_receive_the_event_if_subscribed_to_specific_interface()
         {
-            await Subscribe<MyEvent1>();
+            await Subscribe<IMyEvent1>();
 
             await Publish<IMyEvent>();
 
@@ -126,7 +129,7 @@
         {
             await Subscribe<MyEvent>();
 
-            await subscriptionManager.Unsubscribe(typeof(MyEvent), new ContextBag());
+            await subscriptionManager.Unsubscribe(new MessageMetadata(typeof(MyEvent)), new ContextBag());
 
             //publish a event that that this publisher isn't subscribed to
             await Publish<MyEvent>();
@@ -134,14 +137,31 @@
             AssertNoEventReceived();
         }
 
-        Task Subscribe<T>() => subscriptionManager.Subscribe(typeof(T), new ContextBag());
+        [SetUp]
+        public async Task Prepare()
+        {
+            await Unsubscribe<IEvent>();
+            await Unsubscribe<object>();
+            await Unsubscribe<MyOtherEvent>();
+            await Unsubscribe<MyEvent>();
+            await Unsubscribe<EventBase>();
+            await Unsubscribe<SubEvent1>();
+            await Unsubscribe<SubEvent2>();
+            await Unsubscribe<IMyEvent>();
+            await Unsubscribe<IMyEvent1>();
+            await Unsubscribe<IMyEvent2>();
+            await Unsubscribe<CombinedClassAndInterface>();
+        }
 
-        Task Publish<T>()
+        Task Subscribe<T>(CancellationToken cancellationToken = default) => subscriptionManager.SubscribeAll(new[] { new MessageMetadata(typeof(T)) }, new ContextBag(), cancellationToken);
+        Task Unsubscribe<T>(CancellationToken cancellationToken = default) => subscriptionManager.Unsubscribe(new MessageMetadata(typeof(T)), new ContextBag(), cancellationToken);
+
+        Task Publish<T>(CancellationToken cancellationToken = default)
         {
             var type = typeof(T);
             var message = new OutgoingMessageBuilder().WithBody(new byte[0]).CorrelationId(type.FullName).PublishType(type).Build();
 
-            return messageDispatcher.Dispatch(message, new TransportTransaction(), new ContextBag());
+            return messageDispatcher.Dispatch(message, new TransportTransaction(), cancellationToken);
         }
 
         void AssertReceived<T>()
@@ -192,12 +212,12 @@
 
     }
 
-    public interface MyEvent1 : IMyEvent
+    public interface IMyEvent1 : IMyEvent
     {
 
     }
 
-    public interface MyEvent2 : IMyEvent
+    public interface IMyEvent2 : IMyEvent
     {
 
     }
